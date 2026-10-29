@@ -1,28 +1,34 @@
 #!/bin/bash
 # wallpaper-video — the engine behind the Animated Wallpaper bar widget.
-# Plays every video in a folder as the desktop wallpaper with mpvpaper.
+# Plays the videos in a folder as the desktop wallpaper with mpvpaper.
 #
 # The bar widget owns the settings and calls this script; it can also be run by hand:
 #
-#   wallpaper-video start <folder> [--shuffle] [--pause-hidden] [--output <name>] [--mpv-options "<opts>"]
+#   wallpaper-video start <folder> [--shuffle] [--advance manual|end] [--start-video <file>]
+#                                  [--pause-hidden] [--output <name>] [--mpv-options "<opts>"]
 #   wallpaper-video stop
-#   wallpaper-video next
-#   wallpaper-video status        — one line of JSON: {"running":…,"folder":…,"videos":…}
+#   wallpaper-video next          — skip to the next video; prints its path
+#   wallpaper-video status        — one line of JSON: {"running":…,"folder":…,"videos":…,"video":…}
 #   wallpaper-video count <folder>
+#
+# --advance manual (the default) loops the current video until `next`;
+# --advance end moves on whenever a video finishes.
 #
 # mpvpaper runs in its own session (setsid), so restarting or hot-reloading the
 # Omarchy shell does not take the wallpaper down with it.
 
 set -uo pipefail
 
-STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/wallpaper-video"
+# WALLPAPER_VIDEO_STATE_DIR lets a second instance run beside the real one, for testing.
+STATE_DIR="${WALLPAPER_VIDEO_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/wallpaper-video}"
 PID_FILE="$STATE_DIR/pid"
 FOLDER_FILE="$STATE_DIR/folder"
+PLAYLIST="$STATE_DIR/playlist.m3u"
 SOCKET="$STATE_DIR/mpv.sock"
 LOG_FILE="$STATE_DIR/mpvpaper.log"
 
-# What mpv treats as a video when it expands a folder. gif is an image to mpv by
-# default; moving it over keeps animated gifs working as they did upstream.
+# What counts as a video in the folder. gif is an image to mpv, but it is kept
+# here so animated gifs work as they did upstream.
 VIDEO_EXTS="3g2 3gp avi flv gif m2ts m4v mkv mov mp4 mpeg mpg ogv ts webm wmv"
 
 mkdir -p "$STATE_DIR"
@@ -43,17 +49,21 @@ json_string() {
   python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
 }
 
-count_videos() {
-  local folder="$1" n=0 file ext
-  [[ -d $folder ]] || { echo 0; return; }
-  shopt -s nullglob nocaseglob
+# The folder's videos, one absolute path per line, in natural name order.
+list_videos() {
+  local folder="$1" file ext
+  [[ -d $folder ]] || return 0
+  shopt -s nullglob
   for file in "$folder"/*; do
     [[ -f $file ]] || continue
     ext="${file##*.}"
-    [[ " $VIDEO_EXTS " == *" ${ext,,} "* ]] && n=$((n + 1))
-  done
-  shopt -u nullglob nocaseglob
-  echo "$n"
+    [[ " $VIDEO_EXTS " == *" ${ext,,} "* ]] && printf '%s\n' "$file"
+  done | sort -V
+  shopt -u nullglob
+}
+
+count_videos() {
+  list_videos "$1" | grep -c . || true
 }
 
 running_pid() {
@@ -64,6 +74,42 @@ running_pid() {
   # Guard against a reused pid: it must still be our mpvpaper.
   [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == mpvpaper ]] || return 1
   echo "$pid"
+}
+
+# Talk to mpv over its IPC socket. `mpv_ipc path` prints the current file;
+# `mpv_ipc next` skips ahead and prints the file it landed on.
+mpv_ipc() {
+  python3 -I - "$SOCKET" "$1" <<'EOF'
+import json, socket, sys, time
+
+sock = socket.socket(socket.AF_UNIX)
+sock.settimeout(2)
+sock.connect(sys.argv[1])
+reader = sock.makefile("rb")
+request_id = 0
+
+def call(*command):
+    global request_id
+    request_id += 1
+    sock.sendall((json.dumps({"command": list(command), "request_id": request_id}) + "\n").encode())
+    while True:
+        reply = json.loads(reader.readline())
+        if reply.get("request_id") == request_id:
+            return reply.get("data")
+
+before = call("get_property", "path")
+if sys.argv[2] == "next":
+    call("playlist-next", "force")
+    # The new file loads asynchronously; wait for path to move on. A one-video
+    # folder never changes, so give up after a second and report it as is.
+    for _ in range(20):
+        time.sleep(0.05)
+        now = call("get_property", "path")
+        if now and now != before:
+            before = now
+            break
+print(before or "")
+EOF
 }
 
 stop() {
@@ -80,11 +126,17 @@ stop() {
 }
 
 start() {
-  local folder="" shuffle=no pause_hidden=no output="*" extra=""
+  local folder="" shuffle=no advance=manual start_video="" pause_hidden=no output="*" extra=""
 
   while (($# > 0)); do
     case "$1" in
     --shuffle) shuffle=yes ;;
+    --advance)
+      advance="${2:?--advance needs manual or end}"
+      [[ $advance == manual || $advance == end ]] || die "--advance must be manual or end"
+      shift
+      ;;
+    --start-video) start_video="${2-}"; shift ;;
     --pause-hidden) pause_hidden=yes ;;
     --output) output="${2:?--output needs a monitor name}"; shift ;;
     --mpv-options) extra="${2-}"; shift ;;
@@ -97,16 +149,36 @@ start() {
   [[ -n $folder ]] || die "no folder given"
   folder="$(expand_path "$folder")"
   [[ -d $folder ]] || die "folder not found: $folder"
-  (($(count_videos "$folder") > 0)) || die "no videos in $folder"
+
+  local videos
+  mapfile -t videos < <(list_videos "$folder")
+  ((${#videos[@]} > 0)) || die "no videos in $folder"
 
   command -v mpvpaper >/dev/null 2>&1 || die "mpvpaper is not installed (yay -S mpvpaper)"
 
+  # The playlist is built here rather than handing mpv the folder, so it can
+  # start on a given video: the one that was playing before a logout or an
+  # off/on. Shuffling happens here too, which keeps that video first.
+  [[ $shuffle == yes ]] && mapfile -t videos < <(printf '%s\n' "${videos[@]}" | shuf)
+
+  local first=0 i
+  if [[ -n $start_video ]]; then
+    start_video="$(expand_path "$start_video")"
+    for i in "${!videos[@]}"; do
+      [[ ${videos[$i]} == "$start_video" ]] && { first=$i; break; }
+    done
+  fi
+
   stop
 
-  local opts="no-audio loop-playlist=inf hwdec=auto"
-  opts+=" directory-filter-types=video video-exts-append=gif image-exts-remove=gif"
-  opts+=" input-ipc-server=$SOCKET"
-  [[ $shuffle == yes ]] && opts+=" shuffle"
+  {
+    echo "#EXTM3U"
+    printf '%s\n' "${videos[@]:first}" "${videos[@]:0:first}"
+  } >"$PLAYLIST"
+
+  local opts="no-audio loop-playlist=inf hwdec=auto input-ipc-server=$SOCKET"
+  # loop-file keeps the current video going forever; playlist-next still moves on.
+  [[ $advance == manual ]] && opts+=" loop-file=inf"
   [[ -n $extra ]] && opts+=" $extra"
 
   local args=(-l bottom -o "$opts")
@@ -115,7 +187,7 @@ start() {
   # The bottom layer sits above omarchy-background and below every window, so
   # a shell restart that recreates the static background cannot cover the video.
   # mpvpaper leaves its input region empty, so desktop clicks still reach the shell.
-  setsid mpvpaper "${args[@]}" "$output" "$folder" >"$LOG_FILE" 2>&1 </dev/null &
+  setsid mpvpaper "${args[@]}" "$output" "$PLAYLIST" >"$LOG_FILE" 2>&1 </dev/null &
   local pid=$!
   echo "$pid" >"$PID_FILE"
   printf '%s\n' "$folder" >"$FOLDER_FILE"
@@ -131,22 +203,18 @@ start() {
 
 next() {
   running_pid >/dev/null || die "not running"
-  python3 -I - "$SOCKET" <<'EOF' || die "could not reach mpv"
-import json, socket, sys
-s = socket.socket(socket.AF_UNIX)
-s.connect(sys.argv[1])
-s.sendall((json.dumps({"command": ["playlist-next", "force"]}) + "\n").encode())
-EOF
+  mpv_ipc next || die "could not reach mpv"
 }
 
 status() {
-  local running=false folder="" videos=0
+  local running=false folder="" videos=0 video=""
   if running_pid >/dev/null; then
     running=true
     folder="$(cat "$FOLDER_FILE" 2>/dev/null)"
     videos="$(count_videos "$folder")"
+    video="$(mpv_ipc path 2>/dev/null)"
   fi
-  echo "{\"running\":$running,\"folder\":$(json_string "$folder"),\"videos\":$videos}"
+  echo "{\"running\":$running,\"folder\":$(json_string "$folder"),\"videos\":$videos,\"video\":$(json_string "$video")}"
 }
 
 case "${1:-}" in
@@ -156,7 +224,7 @@ next) next ;;
 status) status ;;
 count) count_videos "$(expand_path "${2:?count needs a folder}")" ;;
 *)
-  sed -n '5,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '5,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
   exit 1
   ;;
 esac

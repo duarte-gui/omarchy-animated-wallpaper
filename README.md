@@ -2,11 +2,12 @@
 
 Play a folder of videos as your desktop wallpaper with [mpvpaper](https://github.com/GhostNaN/mpvpaper), controlled from a button in the Omarchy bar.
 
-This is a fork of [jacobobb/omarchy-animated-wallpaper](https://github.com/jacobobb/omarchy-animated-wallpaper), ported to **Omarchy 4**. Omarchy 4 replaced Waybar and swaybg with the Quickshell-based Omarchy shell, so the original Waybar module and installer no longer work there. Here the button is a native Omarchy shell bar widget, and the wallpaper plays a whole folder instead of a single file.
+This is a fork of [jacobobb/omarchy-animated-wallpaper](https://github.com/jacobobb/omarchy-animated-wallpaper), ported to **Omarchy 4**. Omarchy 4 replaced Waybar and swaybg with the Quickshell-based Omarchy shell, so the original Waybar module and installer no longer work there. Here the button is a native Omarchy shell bar widget, and the wallpaper works from a folder of videos instead of a single file.
 
 ## Features
 
-- Plays every video in a folder, one after the other, looping forever (in name order or shuffled)
+- Loops one video from a folder until you switch with a middle click (or, optionally, moves on whenever a video ends)
+- Remembers which video was playing and comes back to it
 - Choose the folder from the bar (right click) or in the widget settings
 - Remembers whether it was on, so the video comes back after you log in
 - Keeps playing through shell restarts and Omarchy updates
@@ -49,7 +50,7 @@ Then right-click the video icon in the bar and choose a folder of videos.
 |--------|--------|
 | Left click | Turn the wallpaper on or off |
 | Right click | Choose the video folder (and turn it on) |
-| Middle click | Skip to the next video |
+| Middle click | Switch to the next video in the folder |
 | Hover | Folder, number of videos, or the last error |
 
 The icon is dimmed while the wallpaper is off and turns red if it could not start, for example when the folder has no videos. In that case the video that was already playing keeps playing.
@@ -62,9 +63,11 @@ The settings live inline in `~/.config/omarchy/shell.json`, on the `io.github.du
 |-----|---------|--------------|
 | `videoDir` | `~/Videos/Wallpapers` | Folder whose videos play as the wallpaper. Subfolders are not included. |
 | `enabled` | `false` | Whether the wallpaper is playing. The left click flips it. |
-| `order` | `sequential` | `sequential` (name order) or `shuffle` |
+| `order` | `sequential` | Order the middle click walks through: `sequential` (name order) or `shuffle` |
+| `advance` | `manual` | `manual` loops the current video until the middle click; `end` moves on whenever a video finishes |
 | `pauseWhenHidden` | `true` | Pause while windows cover the whole desktop |
 | `mpvOptions` | `""` | Extra mpv options, e.g. `panscan=1.0` to fill the screen without black bars |
+| `currentVideo` | `""` | The video it starts on. The middle click keeps this up to date; empty means the first video. |
 
 ```bash
 omarchy bar set io.github.duarte-gui.animated-wallpaper videoDir ~/Videos/Wallpapers
@@ -80,7 +83,7 @@ omarchy-shell animated-wallpaper toggle   # on/off
 omarchy-shell animated-wallpaper on
 omarchy-shell animated-wallpaper off
 omarchy-shell animated-wallpaper pick     # folder picker
-omarchy-shell animated-wallpaper next     # next video
+omarchy-shell animated-wallpaper next     # switch to the next video
 omarchy-shell animated-wallpaper status
 ```
 
@@ -92,8 +95,8 @@ o.bind("SUPER + ALT + W", "Toggle animated wallpaper", "omarchy-shell animated-w
 
 ## How it works
 
-- `BarWidget.qml` is the bar button. It owns the settings and calls `bin/wallpaper-video`.
-- `bin/wallpaper-video` starts mpvpaper in its own session, so a shell restart or plugin reload does not stop it. The bar only restarts it when a setting actually changes.
+- `BarWidget.qml` is the bar button. It owns the settings and calls `bin/wallpaper-video`. The middle click goes through mpv's IPC socket, so switching videos does not restart the player.
+- `bin/wallpaper-video` builds a playlist from the folder (starting on the remembered video), loops the current file with mpv's `loop-file`, and starts mpvpaper in its own session, so a shell restart or plugin reload does not stop it. The bar only restarts it when a setting actually changes.
 - mpvpaper draws on the Wayland **bottom** layer. That is above the static wallpaper that `omarchy.background` draws on the background layer, and below every window. Using the bottom layer keeps the video on top even when the shell recreates its background. mpvpaper's surface takes no input, so clicks on the desktop still go to Omarchy.
 - Turning it off removes that layer, and your normal Omarchy wallpaper and theme commands (`omarchy theme set`, `omarchy theme bg next`) keep working as before.
 

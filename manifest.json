@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.duarte-gui.animated-wallpaper",
   "name": "Animated Wallpaper",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "duarte-gui (fork of jacobobb/omarchy-animated-wallpaper)",
   "license": "MIT",
   "description": "Play a folder of videos as the desktop wallpaper with mpvpaper, controlled from the Omarchy 4 bar.",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Animated Wallpaper",
-    "description": "Turns a folder of videos into a looping desktop wallpaper. Left click turns it on or off, right click picks the folder, middle click skips to the next video.",
+    "description": "Turns a folder of videos into a looping desktop wallpaper. Left click turns it on or off, right click picks the folder, middle click switches to the next video.",
     "category": "Appearance",
     "aliases": [
       "wallpaper",
@@ -28,8 +28,10 @@
       "videoDir": "~/Videos/Wallpapers",
       "enabled": false,
       "order": "sequential",
+      "advance": "manual",
       "pauseWhenHidden": true,
-      "mpvOptions": ""
+      "mpvOptions": "",
+      "currentVideo": ""
     },
     "schema": [
       {
@@ -37,7 +39,7 @@
         "type": "string",
         "label": "Video folder",
         "defaultValue": "~/Videos/Wallpapers",
-        "description": "Folder whose videos play as the wallpaper, one after the other, looping forever. Right-clicking the bar button opens a folder picker that fills this in. Supports mp4, webm, mkv, mov, avi, gif and the other formats mpv knows as video; subfolders are not included."
+        "description": "Folder of videos for the wallpaper. Right-clicking the bar button opens a folder picker that fills this in. Supports mp4, webm, mkv, mov, avi, gif and the other common video formats; subfolders are not included."
       },
       {
         "key": "enabled",
@@ -55,7 +57,18 @@
           "shuffle"
         ],
         "defaultValue": "sequential",
-        "description": "sequential plays the folder in name order; shuffle mixes it up every time the wallpaper starts."
+        "description": "Order the middle click walks through the folder: sequential is name order, shuffle mixes it up every time the wallpaper starts."
+      },
+      {
+        "key": "advance",
+        "type": "enum",
+        "label": "Switch videos",
+        "options": [
+          "manual",
+          "end"
+        ],
+        "defaultValue": "manual",
+        "description": "manual loops the current video forever and only switches when you middle-click the bar button. end moves on to the next video whenever one finishes."
       },
       {
         "key": "pauseWhenHidden",
@@ -70,6 +83,13 @@
         "label": "Extra mpv options",
         "defaultValue": "",
         "description": "Space-separated mpv options added to the defaults, for example panscan=1.0 to fill the screen without black bars, or speed=0.5."
+      },
+      {
+        "key": "currentVideo",
+        "type": "string",
+        "label": "Current video",
+        "defaultValue": "",
+        "description": "The video the wallpaper starts on. The middle click updates it, so the wallpaper comes back to the same video after you log in. Empty means the first video of the folder."
       }
     ]
   }

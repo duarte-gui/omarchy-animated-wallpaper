@@ -8,7 +8,8 @@ import qs.Ui
 // shell.json) and drives bin/wallpaper-video, which owns the mpvpaper process.
 //
 // Left click turns the wallpaper on or off, right click picks the video folder,
-// middle click skips to the next video.
+// middle click skips to the next video. By default a video loops until the
+// middle click; the one playing is remembered for the next login.
 BarWidget {
   id: root
   moduleName: "io.github.duarte-gui.animated-wallpaper"
@@ -26,18 +27,22 @@ BarWidget {
   readonly property string videoDir: String(setting("videoDir", "~/Videos/Wallpapers"))
   readonly property bool wantOn: setting("enabled", false) === true
   readonly property bool shuffle: setting("order", "sequential") === "shuffle"
+  readonly property string advance: setting("advance", "manual") === "end" ? "end" : "manual"
+  readonly property string currentVideo: String(setting("currentVideo", ""))
   readonly property bool pauseWhenHidden: setting("pauseWhenHidden", true) === true
   readonly property string mpvOptions: String(setting("mpvOptions", ""))
 
   // Everything that changes what mpvpaper should be doing. When it differs from
   // what was last applied, the engine is told again.
-  readonly property string desiredKey: [wantOn, expandPath(videoDir), shuffle, pauseWhenHidden, mpvOptions].join("\u0001")
+  // currentVideo is left out on purpose: remembering it must not restart the player.
+  readonly property string desiredKey: [wantOn, expandPath(videoDir), shuffle, advance, pauseWhenHidden, mpvOptions].join("\u0001")
   property string appliedKey: ""
   property bool ready: false
 
   property bool running: false
   property string playingFolder: ""
   property int videoCount: 0
+  property string playingVideo: ""
   property string lastError: ""
 
   readonly property color barForeground: bar ? bar.barForeground : Color.foreground
@@ -72,8 +77,9 @@ BarWidget {
   }
 
   function startArgs() {
-    var args = ["start", expandPath(videoDir)]
+    var args = ["start", expandPath(videoDir), "--advance", advance]
     if (shuffle) args.push("--shuffle")
+    if (currentVideo !== "") args.push("--start-video", expandPath(currentVideo))
     if (pauseWhenHidden) args.push("--pause-hidden")
     if (mpvOptions.trim() !== "") args.push("--mpv-options", mpvOptions.trim())
     return args
@@ -103,10 +109,20 @@ BarWidget {
       var action = engineProc.command.length > 1 ? engineProc.command[1] : ""
       if (action === "status") {
         root.readStatus(engineOut.text)
+      } else if (action === "next") {
+        // Remember the pick, so the next login comes back to it.
+        var picked = engineOut.text.trim()
+        if (exitCode === 0 && picked !== "") {
+          root.playingVideo = picked
+          root.setSettings({ currentVideo: root.prettyPath(picked) })
+        }
       } else {
         if (action === "start") {
           root.lastError = exitCode === 0 ? "" : engineErr.text.trim().replace(/^wallpaper-video: /, "")
           if (exitCode !== 0) root.notify("Could not start the animated wallpaper", root.lastError)
+          // mpv opens its IPC socket a moment after mpvpaper starts, so the
+          // status right after a start cannot name the video yet; ask again.
+          else settleTimer.restart()
         }
         if (root.pendingArgs === null) root.pendingArgs = ["status"]
       }
@@ -127,6 +143,7 @@ BarWidget {
     running = state.running === true
     playingFolder = String(state.folder || "")
     videoCount = Number(state.videos || 0)
+    playingVideo = String(state.video || "")
 
     if (!ready) {
       ready = true
@@ -150,6 +167,12 @@ BarWidget {
     onTriggered: if (root.desiredKey !== root.appliedKey || (root.wantOn && !root.running)) root.apply()
   }
 
+  Timer {
+    id: settleTimer
+    interval: 1500
+    onTriggered: root.refresh()
+  }
+
   // Notices an mpvpaper that died on its own, so the icon does not lie.
   Timer {
     interval: 15000
@@ -170,12 +193,36 @@ BarWidget {
 
   // --------------------------------------------------------------- actions
 
+  // Our entry as the shell last persisted it, found in its detached bar config.
+  function persistedEntry() {
+    function find(node) {
+      if (!node || typeof node !== "object") return null
+      if (!Array.isArray(node) && node.id === root.moduleName) return node
+      for (var k in node) {
+        var hit = find(node[k])
+        if (hit) return hit
+      }
+      return null
+    }
+    return find(bar && bar.shell ? bar.shell.barConfig : null) || {}
+  }
+
   // Persist inline settings back to shell.json, the same way omarchy.clock
   // stores a cycled format: apply locally first so the UI reacts on the click,
   // then let the bar write the entry.
+  //
+  // updateEntryInline replaces the whole entry, so it is rebuilt from what the
+  // shell persisted plus our local copy. Building it from root.settings alone
+  // wiped videoDir when a call landed on an instance whose settings were not
+  // filled in yet, right after a plugin reload.
   function setSettings(changes) {
     var entry = { id: root.moduleName }
-    for (var name in root.settings) {
+    var saved = persistedEntry()
+    var name
+    for (name in saved) {
+      if (name !== "id") entry[name] = saved[name]
+    }
+    for (name in root.settings) {
       if (name !== "id") entry[name] = root.settings[name]
     }
     for (var key in changes) entry[key] = changes[key]
@@ -229,7 +276,10 @@ BarWidget {
       if (exitCode !== 0 || folder === "") return
       // Picking a folder means "play this", so it also turns the wallpaper on.
       var target = root.leader()
-      target.setSettings({ videoDir: root.prettyPath(folder), enabled: true })
+      // A new folder starts on its own first video, not a file from the old one.
+      var changed = target.expandPath(target.videoDir) !== folder
+      target.setSettings(changed ? { videoDir: root.prettyPath(folder), enabled: true, currentVideo: "" }
+                                 : { videoDir: root.prettyPath(folder), enabled: true })
       target.requestApply()
     }
   }
@@ -249,7 +299,10 @@ BarWidget {
 
   readonly property string statusText: {
     if (lastError !== "") return "error: " + lastError
-    if (running) return "playing " + prettyPath(playingFolder) + " (" + videoCount + (videoCount === 1 ? " video)" : " videos)")
+    if (running) {
+      var name = playingVideo !== "" ? playingVideo.split("/").pop() + " · " : ""
+      return name + prettyPath(playingFolder) + " (" + videoCount + (videoCount === 1 ? " video)" : " videos)")
+    }
     if (wantOn) return "starting " + prettyPath(expandPath(videoDir))
     return "off · " + prettyPath(expandPath(videoDir))
   }
