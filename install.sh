@@ -1,151 +1,126 @@
 #!/bin/bash
-# install.sh — installs wallpaper-video on Omarchy (plug and play)
+#
+# Install the Animated Wallpaper bar widget into the running Omarchy 4 shell.
+#
+#   ./install.sh              sync, validate, rescan, and put it on the bar on first run
+#   ./install.sh --enable     force the bar placement even if already installed
+#   ./install.sh --uninstall  stop the wallpaper, take it off the bar, remove the installed copy
+#   ./install.sh --force      overwrite an install that omarchy plugin add made
+#
+# The shell only watches real files under ~/.config/omarchy/plugins, and
+# omarchy-plugin-validate rejects symlinks inside a plugin folder, so this
+# copies rather than links.
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WAYBAR_CONFIG="$HOME/.config/waybar/config.jsonc"
-WAYBAR_STYLE="$HOME/.config/waybar/style.css"
+SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SECTION="${ANIMATED_WALLPAPER_SECTION:-right}"
 
-# Colors
-OK="\e[32m✓\e[0m"
-SKIP="\e[33m·\e[0m"
-ERR="\e[31m✗\e[0m"
+MODE="install"
+FORCE="no"
+FORCE_ENABLE="no"
 
-echo "→ Installing wallpaper-video..."
+while (($# > 0)); do
+  case "$1" in
+  --uninstall) MODE="uninstall" ;;
+  --enable) FORCE_ENABLE="yes" ;;
+  --force) FORCE="yes" ;;
+  -h | --help)
+    sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    echo "install.sh: unknown option '$1'" >&2
+    exit 1
+    ;;
+  esac
+  shift
+done
 
-# 1. Dependencies
-echo ""
-echo "  Checking dependencies..."
-
-if ! command -v mpvpaper &>/dev/null; then
-  echo -e "  $ERR mpvpaper is not installed. Install it with: yay -S mpvpaper"
+die() {
+  echo "install.sh: $*" >&2
   exit 1
+}
+
+for tool in jq rsync omarchy-plugin-validate omarchy-shell; do
+  command -v "$tool" >/dev/null 2>&1 || die "missing required command: $tool"
+done
+
+[[ -f $SRC/manifest.json ]] || die "no manifest.json next to this script"
+ID="$(jq -r '.id // empty' "$SRC/manifest.json")"
+[[ -n $ID ]] || die "manifest.json has no id"
+
+DEST="$HOME/.config/omarchy/plugins/$ID"
+SHELL_JSON="$HOME/.config/omarchy/shell.json"
+
+if [[ $MODE == uninstall ]]; then
+  "$SRC/bin/wallpaper-video" stop || true
+  omarchy plugin disable "$ID" >/dev/null 2>&1 || true
+  [[ $SRC != "$DEST" ]] && rm -rf "$DEST"
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  echo "removed $ID"
+  exit 0
 fi
-echo -e "  $OK mpvpaper found"
 
-if ! command -v zenity &>/dev/null; then
-  echo -e "  $ERR zenity is not installed. Install it with: sudo pacman -S zenity"
-  exit 1
+[[ $SRC != "$DEST" ]] || die "already running from the plugins directory; nothing to sync"
+
+# Checked before installing anything, so a missing player is reported up front
+# instead of as an error the first time the button is clicked.
+command -v mpvpaper >/dev/null 2>&1 || die "mpvpaper is not installed. Install it with: yay -S mpvpaper"
+command -v zenity >/dev/null 2>&1 || die "zenity is not installed (used by the folder picker): sudo pacman -S zenity"
+
+# An install made by `omarchy plugin add` is a git checkout; rsync --delete
+# would take its working tree with it.
+if [[ -d $DEST/.git && $FORCE != yes ]]; then
+  die "$DEST is a git checkout from 'omarchy plugin add'.
+  Update it with 'omarchy plugin update $ID', or pass --force to overwrite it."
 fi
-echo -e "  $OK zenity found"
 
-# 2. Main script
-echo ""
-echo "  Installing script..."
-install -Dm755 "$SCRIPT_DIR/bin/wallpaper-video" "$HOME/.local/bin/wallpaper-video"
-echo -e "  $OK Script installed at ~/.local/bin/wallpaper-video"
+mkdir -p "$DEST"
+# --delete is what makes a renamed or removed file actually disappear from the
+# installed copy. rsync writes a temp file then renames it, which raises the
+# inotify move event the shell's plugin watcher listens for.
+rsync -a --delete \
+  --exclude '.git/' \
+  --exclude '.github/' \
+  --exclude '.*.swp' \
+  --exclude '*~' \
+  "$SRC/" "$DEST/"
 
-# 3. Add ~/.local/bin to systemd user PATH (required for waybar)
-mkdir -p "$HOME/.config/environment.d"
-if [[ ! -f "$HOME/.config/environment.d/local-bin.conf" ]]; then
-  echo 'PATH=$HOME/.local/bin:$PATH' > "$HOME/.config/environment.d/local-bin.conf"
-  echo -e "  $OK ~/.local/bin added to systemd PATH"
+omarchy plugin validate "$DEST"
+
+omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+
+# Enabling before the shell has finished discovering the plugin fails with
+# "plugin is not known", so wait for it the same way omarchy-plugin-add does.
+known="no"
+for _ in $(seq 1 40); do
+  if omarchy-plugin-list --json 2>/dev/null | jq -e --arg id "$ID" 'any(.[]; .id == $id)' >/dev/null 2>&1; then
+    known="yes"
+    break
+  fi
+  sleep 0.05
+done
+[[ $known == yes ]] || die "the shell did not pick up $ID — check its log with: journalctl --user -e | grep -i quickshell"
+
+# Re-enabling an already-placed widget appends a duplicate layout entry.
+placed="no"
+if [[ -f $SHELL_JSON ]] && jq -e --arg id "$ID" '[.. | objects | select(.id? == $id)] | length > 0' "$SHELL_JSON" >/dev/null 2>&1; then
+  placed="yes"
+fi
+
+if [[ $placed == no || $FORCE_ENABLE == yes ]]; then
+  omarchy plugin enable "$ID" --section "$SECTION"
+  echo "enabled $ID in the $SECTION section"
 else
-  echo -e "  $SKIP systemd PATH already configured"
+  echo "$ID is already on the bar; left its position alone"
 fi
 
-# 4. Waybar: add module to config
-echo ""
-echo "  Configuring waybar..."
+cat <<EOF
 
-if [[ ! -f "$WAYBAR_CONFIG" ]]; then
-  echo -e "  $ERR Waybar config not found at $WAYBAR_CONFIG"
-  exit 1
-fi
+Animated Wallpaper installed.
 
-# 4a+4b. Add module to modules-right and add definition (Python for reliability)
-python3 - "$WAYBAR_CONFIG" << 'PYEOF'
-import sys, re
-
-path = sys.argv[1]
-with open(path, 'r') as f:
-    content = f.read()
-
-# Add to modules-right array (only if not already present)
-if '"custom/wallpaper-video"' not in content:
-    content = re.sub(
-        r'("custom/gdrive-countdown")',
-        r'\1,\n    "custom/wallpaper-video"',
-        content,
-        count=1
-    )
-    print("  added to modules-right")
-else:
-    print("  modules-right already up to date")
-
-# Add module definition (only if not already present)
-module_def = '''  "custom/wallpaper-video": {
-    "exec": "$HOME/.local/bin/wallpaper-video status",
-    "return-type": "json",
-    "interval": "once",
-    "signal": 11,
-    "on-click": "$HOME/.local/bin/wallpaper-video toggle",
-    "on-click-right": "$HOME/.local/bin/wallpaper-video pick",
-    "tooltip": true
-  },\n'''
-
-if '"custom/wallpaper-video":' not in content:
-    # Insert before the "custom/gdrive-countdown": { definition
-    content = re.sub(
-        r'(\s*"custom/gdrive-countdown":\s*\{)',
-        '\n' + module_def + r'\1',
-        content,
-        count=1
-    )
-    print("  module definition added")
-else:
-    print("  module definition already exists")
-
-with open(path, 'w') as f:
-    f.write(content)
-PYEOF
-  echo -e "  $OK Waybar config updated"
-
-# 5. Waybar: add CSS
-if grep -q 'wallpaper-video' "$WAYBAR_STYLE"; then
-  echo -e "  $SKIP CSS already present in style.css"
-else
-  cat >> "$WAYBAR_STYLE" << 'CSSEOF'
-
-/* wallpaper-video */
-#custom-wallpaper-video {
-  margin-left: 14px;
-  padding-left: 14px;
-  border-left: 1px solid;
-  opacity: 0.6;
-  transition: all 0.2s ease;
-}
-#custom-wallpaper-video:hover {
-  opacity: 1;
-}
-#custom-wallpaper-video.active {
-  color: #a6e3a1;
-  opacity: 1;
-}
-#custom-wallpaper-video.inactive {
-  opacity: 0.4;
-}
-CSSEOF
-  echo -e "  $OK CSS added to style.css"
-fi
-
-# 6. Restart waybar
-echo ""
-echo "  Restarting waybar..."
-if command -v omarchy-restart-waybar &>/dev/null; then
-  omarchy-restart-waybar
-  echo -e "  $OK Waybar restarted"
-else
-  pkill waybar 2>/dev/null || true
-  sleep 0.5
-  waybar &
-  disown
-  echo -e "  $OK Waybar restarted"
-fi
-
-echo ""
-echo -e "\e[32mInstallation complete!\e[0m"
-echo ""
-echo "  Right-click '󰕧 Wallpaper' in the bar to select a video."
-echo ""
+  Right-click the video icon in the bar to choose a folder of videos.
+  Settings live inline in $SHELL_JSON, on the "$ID" entry.
+  Drive it with: omarchy-shell animated-wallpaper toggle | on | off | pick | next | status
+EOF

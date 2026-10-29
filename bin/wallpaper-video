@@ -1,214 +1,162 @@
 #!/bin/bash
-# wallpaper-video — animated wallpaper manager for Omarchy/Hyprland
-# Uses mpvpaper to play a video as wallpaper, with per-monitor support.
+# wallpaper-video — the engine behind the Animated Wallpaper bar widget.
+# Plays every video in a folder as the desktop wallpaper with mpvpaper.
 #
-# Commands:
-#   toggle          — start or stop all wallpapers
-#   pick            — pick video: asks which monitor first if multiple detected
-#   start           — start all configured wallpapers
-#   stop            — stop all wallpapers
-#   status          — print JSON for waybar
+# The bar widget owns the settings and calls this script; it can also be run by hand:
+#
+#   wallpaper-video start <folder> [--shuffle] [--pause-hidden] [--output <name>] [--mpv-options "<opts>"]
+#   wallpaper-video stop
+#   wallpaper-video next
+#   wallpaper-video status        — one line of JSON: {"running":…,"folder":…,"videos":…}
+#   wallpaper-video count <folder>
+#
+# mpvpaper runs in its own session (setsid), so restarting or hot-reloading the
+# Omarchy shell does not take the wallpaper down with it.
 
-CONFIG_DIR="$HOME/.config/wallpaper-video"
-MONITORS_DIR="$CONFIG_DIR/monitors"
-WAYBAR_SIGNAL=11
+set -uo pipefail
 
-mkdir -p "$CONFIG_DIR" "$MONITORS_DIR"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/wallpaper-video"
+PID_FILE="$STATE_DIR/pid"
+FOLDER_FILE="$STATE_DIR/folder"
+SOCKET="$STATE_DIR/mpv.sock"
+LOG_FILE="$STATE_DIR/mpvpaper.log"
 
-# --- helpers ---
+# What mpv treats as a video when it expands a folder. gif is an image to mpv by
+# default; moving it over keeps animated gifs working as they did upstream.
+VIDEO_EXTS="3g2 3gp avi flv gif m2ts m4v mkv mov mp4 mpeg mpg ogv ts webm wmv"
 
-get_monitors() {
-  hyprctl monitors -j 2>/dev/null | python3 -c "
-import sys, json
-monitors = json.load(sys.stdin)
-for m in monitors:
-    print(m['name'] + '\t' + m['description'])
-"
+mkdir -p "$STATE_DIR"
+
+die() {
+  echo "wallpaper-video: $*" >&2
+  exit 1
 }
 
-monitor_names() {
-  get_monitors | cut -f1
+expand_path() {
+  local path="$1"
+  [[ $path == "~" || $path == "~/"* ]] && path="$HOME${path:1}"
+  printf '%s\n' "${path%/}"
 }
 
-is_running() {
-  pgrep -x mpvpaper > /dev/null
+json_string() {
+  # Paths may contain quotes or backslashes; let python do the escaping.
+  python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
 }
 
-is_running_on() {
-  local monitor="$1"
-  pgrep -fa "mpvpaper" | grep -q " $monitor " 2>/dev/null
+count_videos() {
+  local folder="$1" n=0 file ext
+  [[ -d $folder ]] || { echo 0; return; }
+  shopt -s nullglob nocaseglob
+  for file in "$folder"/*; do
+    [[ -f $file ]] || continue
+    ext="${file##*.}"
+    [[ " $VIDEO_EXTS " == *" ${ext,,} "* ]] && n=$((n + 1))
+  done
+  shopt -u nullglob nocaseglob
+  echo "$n"
 }
 
-get_video_for() {
-  local monitor="$1"
-  local path="$MONITORS_DIR/$monitor"
-  if [[ -f "$path" ]]; then
-    cat "$path"
-  fi
-}
-
-signal_waybar() {
-  pkill -RTMIN+$WAYBAR_SIGNAL waybar 2>/dev/null || true
-}
-
-# --- core actions ---
-
-start_monitor() {
-  local monitor="$1"
-  local video
-  video=$(get_video_for "$monitor")
-
-  if [[ -z "$video" || ! -f "$video" ]]; then
-    return 1
-  fi
-
-  # Kill existing instance on this monitor if any
-  pkill -f "mpvpaper $monitor " 2>/dev/null || true
-  sleep 0.2
-
-  mpvpaper -o "no-audio loop" "$monitor" "$video" &
-  disown
-}
-
-start() {
-  local started=0
-  while IFS= read -r monitor; do
-    if start_monitor "$monitor"; then
-      started=$((started + 1))
-    fi
-  done < <(monitor_names)
-
-  if [[ $started -eq 0 ]]; then
-    notify-send "Animated wallpaper" "No videos configured. Right-click to pick one." \
-      --urgency=normal 2>/dev/null || true
-  fi
+running_pid() {
+  local pid
+  [[ -f $PID_FILE ]] || return 1
+  pid="$(<"$PID_FILE")"
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  # Guard against a reused pid: it must still be our mpvpaper.
+  [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == mpvpaper ]] || return 1
+  echo "$pid"
 }
 
 stop() {
-  pkill -x mpvpaper 2>/dev/null || true
-  sleep 0.3
+  local pid
+  if pid="$(running_pid)"; then
+    kill "$pid" 2>/dev/null
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE" "$FOLDER_FILE" "$SOCKET"
 }
 
-toggle() {
-  if is_running; then
-    stop
-  else
-    start
+start() {
+  local folder="" shuffle=no pause_hidden=no output="*" extra=""
+
+  while (($# > 0)); do
+    case "$1" in
+    --shuffle) shuffle=yes ;;
+    --pause-hidden) pause_hidden=yes ;;
+    --output) output="${2:?--output needs a monitor name}"; shift ;;
+    --mpv-options) extra="${2-}"; shift ;;
+    -*) die "unknown option '$1'" ;;
+    *) folder="$1" ;;
+    esac
+    shift
+  done
+
+  [[ -n $folder ]] || die "no folder given"
+  folder="$(expand_path "$folder")"
+  [[ -d $folder ]] || die "folder not found: $folder"
+  (($(count_videos "$folder") > 0)) || die "no videos in $folder"
+
+  command -v mpvpaper >/dev/null 2>&1 || die "mpvpaper is not installed (yay -S mpvpaper)"
+
+  stop
+
+  local opts="no-audio loop-playlist=inf hwdec=auto"
+  opts+=" directory-filter-types=video video-exts-append=gif image-exts-remove=gif"
+  opts+=" input-ipc-server=$SOCKET"
+  [[ $shuffle == yes ]] && opts+=" shuffle"
+  [[ -n $extra ]] && opts+=" $extra"
+
+  local args=(-l bottom -o "$opts")
+  [[ $pause_hidden == yes ]] && args=(-p "${args[@]}")
+
+  # The bottom layer sits above omarchy-background and below every window, so
+  # a shell restart that recreates the static background cannot cover the video.
+  # mpvpaper leaves its input region empty, so desktop clicks still reach the shell.
+  setsid mpvpaper "${args[@]}" "$output" "$folder" >"$LOG_FILE" 2>&1 </dev/null &
+  local pid=$!
+  echo "$pid" >"$PID_FILE"
+  printf '%s\n' "$folder" >"$FOLDER_FILE"
+
+  # mpvpaper dies right away on a bad output name or a broken mpv option; say so
+  # instead of reporting a wallpaper that is not there.
+  sleep 0.5
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE" "$FOLDER_FILE"
+    die "mpvpaper exited at start: $(tail -n 3 "$LOG_FILE" | tr '\n' ' ')"
   fi
-  signal_waybar
 }
 
-pick() {
-  local monitors monitor_list monitor video was_running=false
-
-  # Read monitors into array
-  mapfile -t monitors < <(monitor_names)
-
-  if [[ ${#monitors[@]} -eq 0 ]]; then
-    notify-send "Animated wallpaper" "No monitors detected." --urgency=normal 2>/dev/null || true
-    return 1
-  fi
-
-  is_running && was_running=true
-
-  if [[ ${#monitors[@]} -eq 1 ]]; then
-    # Single monitor: skip selection
-    monitor="${monitors[0]}"
-  else
-    # Build list for zenity: "All monitors | monitor1 (desc) | monitor2 (desc)"
-    local zenity_list=("All monitors")
-    while IFS=$'\t' read -r name desc; do
-      zenity_list+=("$name — $desc")
-    done < <(get_monitors)
-
-    local choice
-    choice=$(printf '%s\n' "${zenity_list[@]}" | zenity \
-      --list \
-      --title="Select monitor" \
-      --column="Monitor" \
-      --height=280 \
-      2>/dev/null)
-
-    [[ -z "$choice" ]] && return 0
-
-    if [[ "$choice" == "All monitors" ]]; then
-      monitor="all"
-    else
-      monitor=$(echo "$choice" | cut -d' ' -f1)
-    fi
-  fi
-
-  # Pick video
-  video=$(zenity --file-selection \
-    --title="Select video${monitor:+ for $monitor}" \
-    --file-filter="Videos (mp4, webm, mkv, gif) | *.mp4 *.webm *.mkv *.avi *.mov *.gif *.MP4 *.WEBM *.MKV" \
-    2>/dev/null)
-
-  [[ -z "$video" ]] && return 0
-
-  if [[ "$monitor" == "all" ]]; then
-    while IFS= read -r m; do
-      echo "$video" > "$MONITORS_DIR/$m"
-    done < <(monitor_names)
-  else
-    echo "$video" > "$MONITORS_DIR/$monitor"
-  fi
-
-  # Restart affected instances
-  if $was_running; then
-    if [[ "$monitor" == "all" ]]; then
-      stop
-      start
-    else
-      pkill -f "mpvpaper $monitor " 2>/dev/null || true
-      sleep 0.2
-      start_monitor "$monitor"
-    fi
-  fi
-
-  signal_waybar
+next() {
+  running_pid >/dev/null || die "not running"
+  python3 -I - "$SOCKET" <<'EOF' || die "could not reach mpv"
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"command": ["playlist-next", "force"]}) + "\n").encode())
+EOF
 }
 
 status() {
-  local active=0 total=0 tooltips=()
-
-  while IFS=$'\t' read -r name desc; do
-    total=$((total + 1))
-    local video
-    video=$(get_video_for "$name")
-    local vname
-    vname=$(basename "$video" 2>/dev/null)
-
-    if is_running_on "$name"; then
-      active=$((active + 1))
-      tooltips+=("▶ $name: $vname")
-    else
-      if [[ -n "$video" && -f "$video" ]]; then
-        tooltips+=("⏹ $name: $vname")
-      else
-        tooltips+=("✗ $name: no video")
-      fi
-    fi
-  done < <(get_monitors)
-
-  local tooltip
-  tooltip=$(printf '%s\n' "${tooltips[@]}" | sed ':a;N;$!ba;s/\n/\\n/g')
-  tooltip+="\\nLeft-click to toggle · Right-click to configure"
-
-  if [[ $active -gt 0 ]]; then
-    echo "{\"text\": \"󰕧 Wallpaper\", \"tooltip\": \"$tooltip\", \"class\": \"active\"}"
-  else
-    echo "{\"text\": \"󰕧 Wallpaper\", \"tooltip\": \"$tooltip\", \"class\": \"inactive\"}"
+  local running=false folder="" videos=0
+  if running_pid >/dev/null; then
+    running=true
+    folder="$(cat "$FOLDER_FILE" 2>/dev/null)"
+    videos="$(count_videos "$folder")"
   fi
+  echo "{\"running\":$running,\"folder\":$(json_string "$folder"),\"videos\":$videos}"
 }
 
-# --- main ---
-
 case "${1:-}" in
-  toggle) toggle ;;
-  pick)   pick ;;
-  start)  start; signal_waybar ;;
-  stop)   stop;  signal_waybar ;;
-  status) status ;;
-  *) echo "Usage: wallpaper-video {toggle|pick|start|stop|status}" >&2; exit 1 ;;
+start) shift; start "$@" ;;
+stop) stop ;;
+next) next ;;
+status) status ;;
+count) count_videos "$(expand_path "${2:?count needs a folder}")" ;;
+*)
+  sed -n '5,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  exit 1
+  ;;
 esac

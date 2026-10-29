@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.duarte-gui.animated-wallpaper",
+  "name": "Animated Wallpaper",
+  "version": "2.0.0",
+  "author": "duarte-gui (fork of jacobobb/omarchy-animated-wallpaper)",
+  "license": "MIT",
+  "description": "Play a folder of videos as the desktop wallpaper with mpvpaper, controlled from the Omarchy 4 bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Animated Wallpaper",
+    "description": "Turns a folder of videos into a looping desktop wallpaper. Left click turns it on or off, right click picks the folder, middle click skips to the next video.",
+    "category": "Appearance",
+    "aliases": [
+      "wallpaper",
+      "video wallpaper",
+      "live wallpaper",
+      "mpvpaper"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "videoDir": "~/Videos/Wallpapers",
+      "enabled": false,
+      "order": "sequential",
+      "pauseWhenHidden": true,
+      "mpvOptions": ""
+    },
+    "schema": [
+      {
+        "key": "videoDir",
+        "type": "string",
+        "label": "Video folder",
+        "defaultValue": "~/Videos/Wallpapers",
+        "description": "Folder whose videos play as the wallpaper, one after the other, looping forever. Right-clicking the bar button opens a folder picker that fills this in. Supports mp4, webm, mkv, mov, avi, gif and the other formats mpv knows as video; subfolders are not included."
+      },
+      {
+        "key": "enabled",
+        "type": "boolean",
+        "label": "Wallpaper on",
+        "defaultValue": false,
+        "description": "Whether the animated wallpaper is playing. Left-clicking the bar button flips this, and it is remembered, so the video comes back on its own after you log in again."
+      },
+      {
+        "key": "order",
+        "type": "enum",
+        "label": "Playback order",
+        "options": [
+          "sequential",
+          "shuffle"
+        ],
+        "defaultValue": "sequential",
+        "description": "sequential plays the folder in name order; shuffle mixes it up every time the wallpaper starts."
+      },
+      {
+        "key": "pauseWhenHidden",
+        "type": "boolean",
+        "label": "Pause when covered",
+        "defaultValue": true,
+        "description": "Pause the video while windows cover the whole desktop, so it costs no GPU time when you cannot see it."
+      },
+      {
+        "key": "mpvOptions",
+        "type": "string",
+        "label": "Extra mpv options",
+        "defaultValue": "",
+        "description": "Space-separated mpv options added to the defaults, for example panscan=1.0 to fill the screen without black bars, or speed=0.5."
+      }
+    ]
+  }
+}
