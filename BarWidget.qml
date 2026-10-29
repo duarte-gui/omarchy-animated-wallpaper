@@ -9,7 +9,8 @@ import qs.Ui
 //
 // Left click turns the wallpaper on or off, right click picks the video folder,
 // middle click skips to the next video. By default a video loops until the
-// middle click; the one playing is remembered for the next login.
+// middle click; the one playing is remembered for the next login. Switcher.qml
+// adds the videos to Omarchy's own background switcher.
 BarWidget {
   id: root
   moduleName: "io.github.duarte-gui.animated-wallpaper"
@@ -31,6 +32,8 @@ BarWidget {
   readonly property string currentVideo: String(setting("currentVideo", ""))
   readonly property bool pauseWhenHidden: setting("pauseWhenHidden", true) === true
   readonly property string mpvOptions: String(setting("mpvOptions", ""))
+  readonly property bool switcherIntegration: setting("switcherIntegration", true) === true
+  readonly property string staticBackground: String(setting("staticBackground", ""))
 
   // Everything that changes what mpvpaper should be doing. When it differs from
   // what was last applied, the engine is told again.
@@ -44,6 +47,10 @@ BarWidget {
   property int videoCount: 0
   property string playingVideo: ""
   property string lastError: ""
+  // Set by a start; the first status that names the video then points the
+  // Omarchy background at its poster.
+  property bool posterPending: false
+  readonly property bool engineBusy: engineProc.running || pendingArgs !== null
 
   readonly property color barForeground: bar ? bar.barForeground : Color.foreground
 
@@ -63,13 +70,14 @@ BarWidget {
 
   // ---------------------------------------------------------------- engine
 
-  // One engine call at a time; a call that arrives while another runs replaces
-  // whatever was queued, because only the newest intent matters.
+  // One engine call at a time. A call that arrives while another runs replaces
+  // a queued action, because only the newest intent matters; a status check
+  // never replaces one, or a queued start would be lost to the 15 s refresh.
   property var pendingArgs: null
 
   function runEngine(args) {
     if (engineProc.running) {
-      pendingArgs = args
+      if (args[0] !== "status" || pendingArgs === null) pendingArgs = args
       return
     }
     engineProc.command = [engine].concat(args)
@@ -89,7 +97,17 @@ BarWidget {
     if (!isLeader) return
     appliedKey = desiredKey
     if (!wantOn) lastError = ""
+    posterPending = wantOn
     runEngine(wantOn ? startArgs() : ["stop"])
+  }
+
+  // A start even when no setting in desiredKey moved, such as a different
+  // video picked in the switcher.
+  function startNow() {
+    appliedKey = desiredKey
+    lastError = ""
+    posterPending = true
+    runEngine(startArgs())
   }
 
   function requestApply() {
@@ -115,6 +133,7 @@ BarWidget {
         if (exitCode === 0 && picked !== "") {
           root.playingVideo = picked
           root.setSettings({ currentVideo: root.prettyPath(picked) })
+          switcher.showVideo(picked)
         }
       } else {
         if (action === "start") {
@@ -145,6 +164,11 @@ BarWidget {
     videoCount = Number(state.videos || 0)
     playingVideo = String(state.video || "")
 
+    if (posterPending && running && playingVideo !== "") {
+      posterPending = false
+      switcher.showVideo(playingVideo)
+    }
+
     if (!ready) {
       ready = true
       // A shell restart or plugin reload must not restart a wallpaper that is
@@ -164,7 +188,10 @@ BarWidget {
   Timer {
     id: applyTimer
     interval: 300
-    onTriggered: if (root.desiredKey !== root.appliedKey || (root.wantOn && !root.running)) root.apply()
+    onTriggered: {
+      if (root.desiredKey !== root.appliedKey) root.apply()
+      else if (root.wantOn && !root.running && !root.engineBusy) root.apply()
+    }
   }
 
   Timer {
@@ -245,6 +272,36 @@ BarWidget {
     var target = leader()
     if (target !== root) return target.turn(on)
     if (wantOn !== on) setSettings({ enabled: on })
+    requestApply()
+    // Turning the video off from the bar goes back to the still from before.
+    if (!on) switcher.restoreStill(staticBackground)
+  }
+
+  // ------------------------------------------------------- switcher hooks
+
+  Switcher {
+    id: switcher
+    widget: root
+    active: root.isLeader && root.ready && root.switcherIntegration
+  }
+
+  function rememberStill(path) {
+    var pretty = prettyPath(path)
+    if (pretty !== staticBackground) setSettings({ staticBackground: pretty })
+  }
+
+  // A poster picked in the switcher: play that video.
+  function playFromSwitcher(video) {
+    if (wantOn && running && playingVideo === video) return
+    setSettings({ enabled: true, currentVideo: prettyPath(video) })
+    startNow()
+  }
+
+  // Any other image picked in the switcher: that is the wallpaper now.
+  function stillFromSwitcher(path) {
+    var changes = { staticBackground: prettyPath(path) }
+    if (wantOn) changes.enabled = false
+    setSettings(changes)
     requestApply()
   }
 

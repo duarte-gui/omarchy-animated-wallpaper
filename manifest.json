@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.duarte-gui.animated-wallpaper",
   "name": "Animated Wallpaper",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": "duarte-gui (fork of jacobobb/omarchy-animated-wallpaper)",
   "license": "MIT",
   "description": "Play a folder of videos as the desktop wallpaper with mpvpaper, controlled from the Omarchy 4 bar.",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Animated Wallpaper",
-    "description": "Turns a folder of videos into a looping desktop wallpaper. Left click turns it on or off, right click picks the folder, middle click switches to the next video.",
+    "description": "Turns a folder of videos into a looping desktop wallpaper, listed in Omarchy's own background switcher. Left click turns it on or off, right click picks the folder, middle click switches to the next video.",
     "category": "Appearance",
     "aliases": [
       "wallpaper",
@@ -31,7 +31,9 @@
       "advance": "manual",
       "pauseWhenHidden": true,
       "mpvOptions": "",
-      "currentVideo": ""
+      "currentVideo": "",
+      "switcherIntegration": true,
+      "staticBackground": ""
     },
     "schema": [
       {
@@ -90,6 +92,20 @@
         "label": "Current video",
         "defaultValue": "",
         "description": "The video the wallpaper starts on. The middle click updates it, so the wallpaper comes back to the same video after you log in. Empty means the first video of the folder."
+      },
+      {
+        "key": "switcherIntegration",
+        "type": "boolean",
+        "label": "Show videos in the background switcher",
+        "defaultValue": true,
+        "description": "Put a poster for each video (a frame with a play badge) in ~/.config/omarchy/backgrounds/<theme>/, so the videos show up in Omarchy's background switcher next to your images. Picking a poster plays that video; picking an image turns the video off. Turning this off removes the posters."
+      },
+      {
+        "key": "staticBackground",
+        "type": "string",
+        "label": "Still background",
+        "defaultValue": "",
+        "description": "The image the desktop goes back to when the video is turned off from the bar. It is filled in with the background you had when the video started, or the last image you picked in the switcher. Empty means the theme's first background."
       }
     ]
   }

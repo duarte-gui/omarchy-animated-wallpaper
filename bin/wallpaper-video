@@ -11,6 +11,16 @@
 #   wallpaper-video status        — one line of JSON: {"running":…,"folder":…,"videos":…,"video":…}
 #   wallpaper-video count <folder>
 #
+# Omarchy background switcher integration. The switcher only lists images, so
+# each video gets a poster (a frame with a play badge) in the current theme's
+# ~/.config/omarchy/backgrounds/<theme>/, named <video file>.video.jpg:
+#
+#   wallpaper-video posters <folder>       — create missing posters, drop ones whose video is gone
+#   wallpaper-video posters-clean          — remove every poster from every theme
+#   wallpaper-video show <video>           — make that video's poster the Omarchy background
+#   wallpaper-video theme-background       — first non-poster background Omarchy would pick
+#   wallpaper-video restore [<image>]      — go back to a still background (the theme's if none or gone)
+#
 # --advance manual (the default) loops the current video until `next`;
 # --advance end moves on whenever a video finishes.
 #
@@ -24,12 +34,19 @@ STATE_DIR="${WALLPAPER_VIDEO_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/wallpaper-video
 PID_FILE="$STATE_DIR/pid"
 FOLDER_FILE="$STATE_DIR/folder"
 PLAYLIST="$STATE_DIR/playlist.m3u"
+ORDER_FILE="$STATE_DIR/order"
+ADVANCE_FILE="$STATE_DIR/advance"
 SOCKET="$STATE_DIR/mpv.sock"
 LOG_FILE="$STATE_DIR/mpvpaper.log"
 
 # What counts as a video in the folder. gif is an image to mpv, but it is kept
 # here so animated gifs work as they did upstream.
 VIDEO_EXTS="3g2 3gp avi flv gif m2ts m4v mkv mov mp4 mpeg mpg ogv ts webm wmv"
+
+POSTER_SUFFIX=".video.jpg"
+BACKGROUNDS_ROOT="$HOME/.config/omarchy/backgrounds"
+THEME_NAME_FILE="$HOME/.local/state/omarchy/current/theme.name"
+THEME_BACKGROUNDS="$HOME/.local/state/omarchy/current/theme/backgrounds"
 
 mkdir -p "$STATE_DIR"
 
@@ -79,8 +96,10 @@ running_pid() {
 # Talk to mpv over its IPC socket. `mpv_ipc path` prints the current file;
 # `mpv_ipc next` skips ahead and prints the file it landed on.
 mpv_ipc() {
-  python3 -I - "$SOCKET" "$1" <<'EOF'
+  python3 -I - "$SOCKET" "$1" "$(cat "$ADVANCE_FILE" 2>/dev/null)" "$ORDER_FILE" <<'EOF'
 import json, socket, sys, time
+
+action, advance, order_file = sys.argv[2], sys.argv[3], sys.argv[4]
 
 sock = socket.socket(socket.AF_UNIX)
 sock.settimeout(2)
@@ -98,8 +117,18 @@ def call(*command):
             return reply.get("data")
 
 before = call("get_property", "path")
-if sys.argv[2] == "next":
-    call("playlist-next", "force")
+if action == "next":
+    try:
+        order = [line for line in open(order_file).read().splitlines() if line]
+    except OSError:
+        order = []
+    if advance == "manual" and order:
+        # In manual mode mpv only holds the current video, so the next one comes
+        # from the order the engine saved at start.
+        index = order.index(before) if before in order else -1
+        call("loadfile", order[(index + 1) % len(order)], "replace")
+    else:
+        call("playlist-next", "force")
     # The new file loads asynchronously; wait for path to move on. A one-video
     # folder never changes, so give up after a second and report it as is.
     for _ in range(20):
@@ -122,7 +151,7 @@ stop() {
     done
     kill -9 "$pid" 2>/dev/null || true
   fi
-  rm -f "$PID_FILE" "$FOLDER_FILE" "$SOCKET"
+  rm -f "$PID_FILE" "$FOLDER_FILE" "$SOCKET" "$ORDER_FILE" "$ADVANCE_FILE"
 }
 
 start() {
@@ -171,13 +200,25 @@ start() {
 
   stop
 
+  printf '%s\n' "${videos[@]:first}" "${videos[@]:0:first}" >"$ORDER_FILE"
+  echo "$advance" >"$ADVANCE_FILE"
+
+  # In manual mode mpv gets a playlist of just the current video. loop-file
+  # loops it by seeking back to the start, which fails on files without a seek
+  # index (common in downloaded webm); mpv then moves to the next playlist entry,
+  # and with a one-entry playlist that entry is the same video again, reopened.
   {
     echo "#EXTM3U"
-    printf '%s\n' "${videos[@]:first}" "${videos[@]:0:first}"
+    if [[ $advance == manual ]]; then
+      echo "${videos[first]}"
+    else
+      cat "$ORDER_FILE"
+    fi
   } >"$PLAYLIST"
 
-  local opts="no-audio loop-playlist=inf hwdec=auto input-ipc-server=$SOCKET"
-  # loop-file keeps the current video going forever; playlist-next still moves on.
+  # quiet drops mpv's status line, which otherwise grows the log in the
+  # runtime dir (RAM) by a line per frame for as long as the wallpaper plays.
+  local opts="no-audio quiet loop-playlist=inf hwdec=auto input-ipc-server=$SOCKET"
   [[ $advance == manual ]] && opts+=" loop-file=inf"
   [[ -n $extra ]] && opts+=" $extra"
 
@@ -199,6 +240,113 @@ start() {
     rm -f "$PID_FILE" "$FOLDER_FILE"
     die "mpvpaper exited at start: $(tail -n 3 "$LOG_FILE" | tr '\n' ' ')"
   fi
+}
+
+# ------------------------------------------------------- switcher integration
+
+poster_dir() {
+  local theme
+  theme="$(cat "$THEME_NAME_FILE" 2>/dev/null)"
+  [[ -n $theme ]] || die "no current Omarchy theme in $THEME_NAME_FILE"
+  echo "$BACKGROUNDS_ROOT/$theme"
+}
+
+poster_of() {
+  echo "$(poster_dir)/${1##*/}$POSTER_SUFFIX"
+}
+
+make_poster() {
+  local video="$1" out="$2" tmp="$STATE_DIR/poster.$$.jpg" at
+  # The frame at 1 s skips the black lead-in many clips have; very short clips
+  # and gifs fall back to the first frame.
+  for at in 1 0; do
+    ffmpeg -nostdin -loglevel error -y -ss "$at" -i "$video" -frames:v 1 \
+      -vf "scale='min(2560,iw)':-2" -q:v 3 "$tmp" 2>/dev/null && [[ -s $tmp ]] && break
+  done
+  [[ -s $tmp ]] || { rm -f "$tmp"; echo "wallpaper-video: no frame from $video" >&2; return 1; }
+
+  # A play badge in the middle tells videos apart from still images in the switcher.
+  if command -v magick >/dev/null 2>&1; then
+    local w h
+    read -r w h < <(magick identify -format '%w %h' "$tmp" 2>/dev/null)
+    if [[ -n ${h-} ]]; then
+      magick "$tmp" -fill 'rgba(0,0,0,0.55)' \
+        -draw "$(awk -v w="$w" -v h="$h" 'BEGIN {
+          cx = w / 2; cy = h / 2; r = h / 11
+          printf "circle %d,%d %d,%d", cx, cy, cx + r, cy }')" \
+        -fill 'rgba(255,255,255,0.92)' \
+        -draw "$(awk -v w="$w" -v h="$h" 'BEGIN {
+          cx = w / 2; cy = h / 2; r = h / 11
+          printf "polygon %d,%d %d,%d %d,%d", cx - r * 0.32, cy - r * 0.52, cx - r * 0.32, cy + r * 0.52, cx + r * 0.58, cy }')" \
+        "$tmp" 2>/dev/null || true
+    fi
+  fi
+  # Written in the runtime dir first: the switcher scans for *.jpg, and must
+  # never pick up a half-written poster.
+  mv -f "$tmp" "$out"
+}
+
+posters() {
+  local folder dest video out name
+  folder="$(expand_path "${1:?posters needs a folder}")"
+  dest="$(poster_dir)"
+  mkdir -p "$dest"
+
+  local -A keep=()
+  while IFS= read -r video; do
+    out="$dest/${video##*/}$POSTER_SUFFIX"
+    keep["${out##*/}"]=1
+    [[ -f $out && $out -nt $video ]] || make_poster "$video" "$out" || true
+  done < <(list_videos "$folder")
+
+  # Posters whose video left the folder, or that came from a previous folder.
+  shopt -s nullglob
+  for out in "$dest"/*"$POSTER_SUFFIX"; do
+    name="${out##*/}"
+    [[ -n ${keep[$name]-} ]] || rm -f "$out"
+  done
+  shopt -u nullglob
+  echo "$dest"
+}
+
+posters_clean() {
+  local dir
+  shopt -s nullglob
+  rm -f "$BACKGROUNDS_ROOT"/*/*"$POSTER_SUFFIX"
+  for dir in "$BACKGROUNDS_ROOT"/*/; do rmdir "$dir" 2>/dev/null || true; done
+  shopt -u nullglob
+  rmdir "$BACKGROUNDS_ROOT" 2>/dev/null || true
+}
+
+show() {
+  local video out
+  video="$(expand_path "${1:?show needs a video}")"
+  [[ -f $video ]] || die "video not found: $video"
+  out="$(poster_of "$video")"
+  mkdir -p "${out%/*}"
+  [[ -f $out ]] || make_poster "$video" "$out" || die "could not make a poster for $video"
+  omarchy-theme-bg-set "$out" >/dev/null
+  echo "$out"
+}
+
+# The background Omarchy itself would choose for the current theme, minus our
+# posters — what a theme change should land on while the video is off.
+theme_background() {
+  find -L "$(poster_dir)/" "$THEME_BACKGROUNDS/" -maxdepth 1 -type f \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' \) \
+    ! -name "*$POSTER_SUFFIX" -print0 2>/dev/null | sort -z | head -z -n 1 | tr -d '\0'
+  echo
+}
+
+restore() {
+  local image
+  image="$(expand_path "${1-}")"
+  if [[ -z $image || ! -f $image || $image == *"$POSTER_SUFFIX" ]]; then
+    image="$(theme_background)"
+  fi
+  [[ -n $image ]] || die "no still background to go back to"
+  omarchy-theme-bg-set "$image" >/dev/null
+  echo "$image"
 }
 
 next() {
@@ -223,8 +371,13 @@ stop) stop ;;
 next) next ;;
 status) status ;;
 count) count_videos "$(expand_path "${2:?count needs a folder}")" ;;
+posters) posters "${2-}" ;;
+posters-clean) posters_clean ;;
+show) show "${2-}" ;;
+theme-background) theme_background ;;
+restore) restore "${2-}" ;;
 *)
-  sed -n '5,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '5,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
   exit 1
   ;;
 esac

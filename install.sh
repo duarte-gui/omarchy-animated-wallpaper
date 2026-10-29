@@ -55,6 +55,12 @@ SHELL_JSON="$HOME/.config/omarchy/shell.json"
 
 if [[ $MODE == uninstall ]]; then
   "$SRC/bin/wallpaper-video" stop || true
+  # Leave a still background behind, not a poster of a video that is gone.
+  if [[ "$(readlink -f "$HOME/.local/state/omarchy/current/background")" == *.video.jpg ]]; then
+    still="$(jq -r --arg id "$ID" '[.. | objects | select(.id? == $id) | .staticBackground // empty] | first // empty' "$SHELL_JSON" 2>/dev/null)"
+    "$SRC/bin/wallpaper-video" restore "$still" >/dev/null || true
+  fi
+  "$SRC/bin/wallpaper-video" posters-clean || true
   omarchy plugin disable "$ID" >/dev/null 2>&1 || true
   [[ $SRC != "$DEST" ]] && rm -rf "$DEST"
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
@@ -68,6 +74,8 @@ fi
 # instead of as an error the first time the button is clicked.
 command -v mpvpaper >/dev/null 2>&1 || die "mpvpaper is not installed. Install it with: yay -S mpvpaper"
 command -v zenity >/dev/null 2>&1 || die "zenity is not installed (used by the folder picker): sudo pacman -S zenity"
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is not installed (used for the switcher posters): sudo pacman -S ffmpeg"
+command -v magick >/dev/null 2>&1 || echo "install.sh: imagemagick not found; switcher posters will have no play badge (sudo pacman -S imagemagick)" >&2
 
 # An install made by `omarchy plugin add` is a git checkout; rsync --delete
 # would take its working tree with it.
